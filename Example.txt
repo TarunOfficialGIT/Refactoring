@@ -1,0 +1,212 @@
+Refactoring Principles:-
+
+1. Hide “how” with “what”
+2. Aim for consistency
+3. Avoid deep nesting
+4. Separate concerns (= Single Responsibility Principle)
+5. Avoid duplication wisely (= Don’t Repeat Yourself)
+
+
+1. Hide “how” with “what”
+
+Before Refactoring:
+
+mainDistribution.contents(copySpec -> copySpec.filesMatching(patchModuleExtension.getJars(), action -> {
+  RelativePath relativePath = action.getRelativePath().getParent().getParent()
+      .append(true, "patchlibs", action.getName());
+  action.setRelativePath(relativePath);
+}));
+
+After Refactoring:
+
+mainDistribution.contents(
+    copySpec -> copySpec.filesMatching(patchModuleExtension.getJars(), this::updateRelativePath)
+);
+
+2. Aim for consistency
+
+Before Refactoring:
+
+  public void configureJavaDoc(Project project) {
+    Javadoc javadoc = (Javadoc) project.getTasks().findByName(JavaPlugin.JAVADOC_TASK_NAME);
+    if (javadoc != null) {
+      // ...
+    }
+  }
+}
+ 
+public class TestTask {
+  public void configureTestJava(Project project, String moduleName) {
+    Test testJava = (Test) project.getTasks().findByName(JavaPlugin.TEST_TASK_NAME);
+    // ... (no null check)
+  }
+}
+
+After Refactoring:
+
+public class JavadocTask extends AbstractModulePluginTask {
+  public void configureJavaDoc() {
+    helper().findTask(JavaPlugin.JAVADOC_TASK_NAME, Javadoc.class)
+        .ifPresent(this::configureJavaDoc);
+  }
+ 
+  private void configureJavaDoc(Javadoc javadoc) { /* ... */ }
+}
+ 
+public class TestTask extends AbstractModulePluginTask {
+  public void configureTestJava() {
+    helper().findTask(JavaPlugin.TEST_TASK_NAME, Test.class)
+        .ifPresent(this::configureTestJava);
+  }
+ 
+  private void configureTestJava(Test testJava) { /* ... */ }
+}
+
+3. Avoid deep nesting
+
+Before Refactoring:
+
+private static Set<String> getPackages(Collection<File> dirs) {
+  Set<String> packages = new TreeSet<>();
+  for (File dir : dirs) {
+    if (dir.isDirectory()) {
+      Path dirPath = dir.toPath();
+      try (Stream<Path> entries = Files.walk(dirPath)) {
+        entries.forEach(entry -> {
+          if (entry.toFile().isFile()) {
+            String path = entry.toString();
+            if (isValidClassFileReference(path)) {
+              Path relPath = dirPath.relativize(entry.getParent());
+              packages.add(relPath.toString().replace(File.separatorChar, '.'));
+            }
+          }
+        });
+      } catch (IOException e) {
+        throw new GradleException("Failed to scan " + dir, e);
+      }
+    }
+  }
+  return packages;
+}
+
+After Refactoring:
+
+private static Set<String> getPackages(Collection<File> dirs) {
+  return dirs.stream()
+      .map(File::toPath)
+      .filter(Files::isDirectory)
+      .flatMap(TestTask::buildRelativePathStream)
+      .map(relPath -> relPath.toString().replace(File.separatorChar, '.'))
+      .collect(Collectors.toCollection(TreeSet::new));
+}
+ 
+private static Stream<Path> buildRelativePathStream(Path dir) {
+  try {
+    return Files.walk(dir)
+        .filter(Files::isRegularFile)
+        .filter(path -> isValidClassFileReference(path.toString()))
+        .map(path -> dir.relativize(path.getParent()));
+  } catch (IOException e) {
+    throw new GradleException("Failed to scan " + dir, e);
+  }
+}
+
+4. Separate concerns (= Single Responsibility Principle)
+
+Before Refactoring:
+
+public class RunTaskMutator {
+  // common fields
+ 
+  public void configureRun() { /* ... */ }
+ 
+  public void updateStartScriptsTask(String taskStartScriptsName) { /* ... */ }
+ 
+  // 12 other methods (incl. 2 common methods)
+}
+
+After Refactoring:
+
+public class RunTaskMutator extends AbstractExecutionMutator {
+ 
+  public void configureRun() { /* ... */ }
+   
+  // 2 other methods
+}
+ 
+public class StartScriptsMutator extends AbstractExecutionMutator {
+ 
+  public void updateStartScriptsTask(String taskStartScriptsName) { /* ... */ }
+ 
+  // 8 other methods
+}
+
+5. Avoid duplication wisely (= Don’t Repeat Yourself)
+
+Before Refactoring:
+
+// 1. PatchModuleExtension
+public List<String> configure(FileCollection classpath) {
+  List<String> args = new ArrayList<>();
+ 
+  config.forEach(patch -> {
+        String[] split = patch.split("=");
+ 
+        String asPath = classpath.filter(jar -> jar.getName().endsWith(split[1])).getAsPath();
+ 
+        if (asPath.length() > 0) {
+          args.add("--patch-module");
+          args.add(split[0] + "=" + asPath);
+        }
+      }
+  );
+ 
+  return args;
+}
+ 
+// 2. TestTask
+args.addAll(patchModuleExtension.configure(testJava.getClasspath()));
+ 
+// 3. RunTaskMutator
+patchModuleExtension.getConfig().forEach(patch -> {
+      String[] split = patch.split("=");
+      jvmArgs.add("--patch-module");
+      jvmArgs.add(split[0] + "=" + PATCH_LIBS_PLACEHOLDER + "/" + split[1]);
+    }
+);
+ 
+// 4. JavadocTask
+patchModuleExtension.getConfig().forEach(patch -> {
+      String[] split = patch.split("=");
+ 
+      String asPath = javadoc.getClasspath().filter(jar -> jar.getName().endsWith(split[1])).getAsPath();
+ 
+      if (asPath != null && asPath.length() > 0) {
+        options.addStringOption("-patch-module", split[0] + "=" + asPath);
+      }
+    }
+);
+
+After Refactoring:
+
+// 1. PatchModuleExtension
+public PatchModuleResolver resolve(FileCollection classpath) {
+  return resolve(jarName -> classpath.filter(jar -> jar.getName().endsWith(jarName)).getAsPath());
+}
+ 
+public PatchModuleResolver resolve(UnaryOperator<String> jarNameResolver) {
+  return new PatchModuleResolver(this, jarNameResolver);
+}
+ 
+// 2. TestTask
+patchModuleExtension.resolve(testJava.getClasspath()).toArgumentStream().forEach(jvmArgs::add);
+ 
+// 3. RunTaskMutator
+patchModuleExtension.resolve(jarName -> PATCH_LIBS_PLACEHOLDER + "/" + jarName).toArgumentStream().forEach(jvmArgs::add);
+ 
+// 4. JavadocTask
+patchModuleExtension.resolve(javadoc.getClasspath()).toValueStream()
+    .forEach(value -> options.addStringOption("-patch-module", value));
+
+
+---------- The End ----------
